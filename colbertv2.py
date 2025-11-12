@@ -65,8 +65,13 @@ def main():
     
     base_dir = r"./"
     
-    # TODO: Download ColBERTv2 checkpoint from: https://huggingface.co/colbert-ir/colbertv2.0
-    colbert_ckpt = "colbert-ir/colbertv2.0"  
+    # Default checkpoint: use the HF repo id (will download if not present).
+    # If you already downloaded a local checkpoint tar.gz, set `colbert_ckpt` to its path.
+    # Notes:
+    # - Public repo id: 'colbert-ir/colbertv2.0' (recommended).
+    # - If the repo is private or gated, authenticate with `huggingface-cli login`
+    #   or set the env var HUGGINGFACE_HUB_TOKEN.
+    colbert_ckpt = r"colbert-ir/colbertv2.0"  
     collection_path = os.path.join(base_dir, "collection.tsv")
     queries_path    = os.path.join(base_dir, "queries.dev.tsv")
     qrels_path      = os.path.join(base_dir, "qrels.dev.tsv")
@@ -98,8 +103,21 @@ def main():
         root = root,
         # you may set other params, e.g., nbits compression etc
     )
-    indexer = Indexer(checkpoint=colbert_ckpt, config=config)
-    indexer.index(name=index_name, collection=collection_path)
+
+    try:
+        indexer = Indexer(checkpoint=colbert_ckpt, config=config)
+        indexer.index(name=index_name, collection=collection_path)
+    except OSError as e:
+        print("\n❌ Failed to load the ColBERT checkpoint.")
+        print("Reason:", str(e))
+        print("\nPossible causes and fixes:")
+        print(" - You provided a local path that doesn't exist. Check the path and re-run.")
+        print(" - You passed a Hugging Face repo id but it's private/gated. Authenticate by:")
+        print("     1) running: huggingface-cli login")
+        print("     2) or setting env var: set HUGGINGFACE_HUB_TOKEN=<your_token> in PowerShell")
+        print(" - Alternatively, download the checkpoint tar.gz manually and set `colbert_ckpt` to its path.")
+        print("\nAfter fixing authentication or using a local checkpoint, re-run this script.")
+        return
     
     # 2. Retrieval
     searcher = Searcher(index=index_name, config=config)
