@@ -63,7 +63,7 @@ def main():
     # You can also pass these as command line arguments
     import sys
     
-    base_dir = r"d:\Github Repos\ColBERT-and-SPLADE"
+    base_dir = r"./"
     
     # TODO: Download ColBERTv2 checkpoint from: https://huggingface.co/colbert-ir/colbertv2.0
     colbert_ckpt = r"colbertv2.0.tar.gz"  
