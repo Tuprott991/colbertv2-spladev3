@@ -91,12 +91,22 @@ def main():
             print(f"✓ {name}: {path}")
     
     # Check checkpoint
-    if not os.path.exists(colbert_ckpt):
-        print(f"\n❌ Error: ColBERT checkpoint not found: {colbert_ckpt}")
-        print("Please download the checkpoint from: https://huggingface.co/colbert-ir/colbertv2.0")
-        print("Or use another ColBERT checkpoint and update the path.")
-        return
-    print(f"✓ Checkpoint: {colbert_ckpt}\n")
+    # - If the value looks like a local path (contains path separator or endswith .tar.gz), verify it exists.
+    # - Otherwise treat it as a Hugging Face repo id (will be downloaded by transformers/huggingface_hub).
+    looks_like_local = (os.path.sep in colbert_ckpt) or colbert_ckpt.endswith('.tar.gz')
+    if looks_like_local:
+        if not os.path.exists(colbert_ckpt):
+            print(f"\n❌ Error: ColBERT checkpoint not found: {colbert_ckpt}")
+            print("If you intended a local file, please check the path and re-run.")
+            print("You can download the checkpoint from: https://huggingface.co/colbert-ir/colbertv2.0")
+            return
+        else:
+            print(f"✓ Checkpoint (local): {colbert_ckpt}\n")
+    else:
+        # Treat as HF repo id
+        print(f"✓ Checkpoint (HF repo id): {colbert_ckpt} — will download if not present.")
+        print("If this repo is private/gated, authenticate with `huggingface-cli login` or set HUGGINGFACE_HUB_TOKEN.")
+        print("")
 
     # 1. Indexing (if not already done)
     config = ColBERTConfig(
