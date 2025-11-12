@@ -66,7 +66,7 @@ def main():
     base_dir = r"./"
     
     # TODO: Download ColBERTv2 checkpoint from: https://huggingface.co/colbert-ir/colbertv2.0
-    colbert_ckpt = r"colbertv2.0.tar.gz"  
+    colbert_ckpt = "colbert-ir/colbertv2.0"  
     collection_path = os.path.join(base_dir, "collection.tsv")
     queries_path    = os.path.join(base_dir, "queries.dev.tsv")
     qrels_path      = os.path.join(base_dir, "qrels.dev.tsv")
