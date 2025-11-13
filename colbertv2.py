@@ -116,7 +116,14 @@ def main():
 
     try:
         indexer = Indexer(checkpoint=colbert_ckpt, config=config)
-        indexer.index(name=index_name, collection=collection_path)
+        # Check if index already exists
+        index_path = os.path.join(root, "default", "indexes", index_name)
+        if os.path.exists(index_path):
+            print(f"\n✓ Index already exists at: {index_path}")
+            print("Reusing existing index...\n")
+        else:
+            print(f"\nIndexing collection into: {index_path}")
+            indexer.index(name=index_name, collection=collection_path)
     except OSError as e:
         print("\n❌ Failed to load the ColBERT checkpoint.")
         print("Reason:", str(e))
