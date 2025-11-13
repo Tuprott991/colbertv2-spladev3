@@ -68,7 +68,24 @@ def try_ptflops(model, input_res, device):
         # model should be on device
         model = model.to(device)
         # get_model_complexity_info expects a function signature that accepts the tensor size
-        macs, params = get_model_complexity_info(model, input_res, as_strings=False, print_per_layer_stat=False, verbose=False)
+        # For embedding models, we need to use input_constructor to generate integer tensors
+        def input_constructor(input_shape):
+            # input_shape is a tuple like (seq_len,)
+            # Return a dict or tuple that can be passed to model.forward()
+            batch_size = 1
+            seq_len = input_shape[0]
+            # Generate random integer tensor for input_ids
+            input_ids = torch.randint(0, 30522, (batch_size, seq_len), dtype=torch.long, device=device)
+            return {'input_ids': input_ids}
+        
+        macs, params = get_model_complexity_info(
+            model, 
+            input_res, 
+            as_strings=False, 
+            print_per_layer_stat=False, 
+            verbose=False,
+            input_constructor=input_constructor
+        )
         return macs, params
     except Exception as e:
         print(f"ptflops failed: {e}")
@@ -97,7 +114,14 @@ class HFWrapper(torch.nn.Module):
         super().__init__()
         self.model = model
 
-    def forward(self, input_ids):
+    def forward(self, input_ids=None, **kwargs):
+        # Handle both dict input from input_constructor and direct tensor input
+        if input_ids is None and 'input_ids' in kwargs:
+            input_ids = kwargs['input_ids']
+        elif isinstance(input_ids, dict):
+            # If first arg is a dict (from input_constructor), extract input_ids
+            input_ids = input_ids['input_ids']
+        
         # input_ids: [B, L]
         outputs = self.model(input_ids=input_ids)
         # return logits or last hidden state to let ptflops count operations
