@@ -134,6 +134,25 @@ class HFWrapper(torch.nn.Module):
             return outputs
 
 
+class LongMatrixWrapper(torch.nn.Module):
+    """Wrap a LongMatrix model so ptflops can call forward with input_ids tensor."""
+    def __init__(self, model, topk_tokens=1):
+        super().__init__()
+        self.model = model
+        self.topk_tokens = topk_tokens
+
+    def forward(self, input_ids):
+        # input_ids: [B, L] - tensor passed as positional argument from input_constructor
+        # Create attention_mask (all 1s for simplicity in FLOPs estimation)
+        attention_mask = torch.ones_like(input_ids)
+        batch_tok = {'input_ids': input_ids, 'attention_mask': attention_mask}
+        
+        # Call encode method
+        out = self.model.encode(batch_tok, topk_tokens=self.topk_tokens)
+        # Return the dense embedding 'z'
+        return out['z']
+
+
 def human_readable_params(n):
     if n is None:
         return 'unknown'
@@ -380,8 +399,17 @@ def main():
 
         params = count_params(model)
         print(f"Model params: {human_readable_params(params)}")
+        
+        # Check if this is a LongMatrix model (has 'encode' method but not standard forward)
+        is_longmatrix = hasattr(model, 'encode') and hasattr(model, 'lexical') and hasattr(model, 'proj')
+        
         # try ptflops
-        wrapper = model
+        if is_longmatrix:
+            print("Detected LongMatrix model - using LongMatrixWrapper for FLOPs estimation")
+            wrapper = LongMatrixWrapper(model, topk_tokens=1)
+        else:
+            wrapper = model
+        
         # try input_res approximate
         input_res = (args.seq_len,)
         macs, params_pt = try_ptflops(wrapper, input_res, device, batch_size=args.flops_batch_size)
