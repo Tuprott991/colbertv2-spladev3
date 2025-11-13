@@ -10,6 +10,7 @@ from tqdm import tqdm
 import torch
 from sentence_transformers import SparseEncoder
 import argparse
+import time
 
 
 def load_collection(collection_path):
@@ -133,15 +134,36 @@ def search_with_splade(model, queries, collection, k=10, batch_size=32, device='
     doc_texts = [collection[pid] for pid in doc_ids]
     
     all_doc_embeddings = []
+    doc_encoding_time = 0.0
+    
     for i in tqdm(range(0, len(doc_texts), batch_size), desc="Encoding documents"):
         batch = doc_texts[i:i+batch_size]
+        
+        # Measure encoding time
+        start_time = time.time()
         with torch.no_grad():
             embeddings = model.encode_document(batch)
-            all_doc_embeddings.append(embeddings)
+            if device == 'cuda':
+                torch.cuda.synchronize()  # Wait for GPU operations to complete
+        doc_encoding_time += time.time() - start_time
+        
+        all_doc_embeddings.append(embeddings)
     
     # Concatenate all document embeddings
     doc_embeddings = torch.cat(all_doc_embeddings, dim=0)  # [num_docs, vocab_size]
     print(f"✓ Document embeddings shape: {doc_embeddings.shape}")
+    print(f"✓ Document encoding time: {doc_encoding_time:.2f}s")
+    print(f"✓ Avg time per document: {doc_encoding_time / len(collection) * 1000:.2f}ms")
+    
+    # Calculate approximate FLOPs for document encoding
+    # Approximate: embedding_dim * num_tokens * num_docs
+    vocab_size = doc_embeddings.shape[1]
+    avg_tokens_per_doc = 100  # Approximate average
+    approx_flops_per_doc = vocab_size * avg_tokens_per_doc * 2  # 2 for multiply-add
+    total_doc_flops = approx_flops_per_doc * len(collection)
+    flops_per_sec = total_doc_flops / doc_encoding_time if doc_encoding_time > 0 else 0
+    print(f"✓ Approx document encoding: {total_doc_flops / 1e9:.2f} GFLOPs")
+    print(f"✓ Throughput: {flops_per_sec / 1e9:.2f} GFLOPs/s")
     
     # Encode queries and search
     print(f"\nSearching {len(queries)} queries...")
@@ -150,19 +172,30 @@ def search_with_splade(model, queries, collection, k=10, batch_size=32, device='
     query_ids = list(queries.keys())
     query_texts = [queries[qid] for qid in query_ids]
     
+    query_encoding_time = 0.0
+    search_time = 0.0
+    
     for i in tqdm(range(0, len(query_texts), batch_size), desc="Searching"):
         batch_qids = query_ids[i:i+batch_size]
         batch_queries = query_texts[i:i+batch_size]
         
         with torch.no_grad():
             # Encode queries
+            start_time = time.time()
             query_embeddings = model.encode_query(batch_queries)  # [batch_size, vocab_size]
+            if device == 'cuda':
+                torch.cuda.synchronize()
+            query_encoding_time += time.time() - start_time
             
             # Compute similarities with all documents
+            start_time = time.time()
             similarities = model.similarity(query_embeddings, doc_embeddings)  # [batch_size, num_docs]
             
             # Get top-k for each query
             top_k_scores, top_k_indices = torch.topk(similarities, k=min(k, len(doc_ids)), dim=1)
+            if device == 'cuda':
+                torch.cuda.synchronize()
+            search_time += time.time() - start_time
             
             # Convert to ranked lists
             for j, qid in enumerate(batch_qids):
@@ -171,6 +204,22 @@ def search_with_splade(model, queries, collection, k=10, batch_size=32, device='
                 ranked_lists[qid] = ranked_pids
     
     print(f"✓ Retrieved results for {len(ranked_lists)} queries")
+    print(f"✓ Query encoding time: {query_encoding_time:.2f}s")
+    print(f"✓ Avg time per query: {query_encoding_time / len(queries) * 1000:.2f}ms")
+    
+    # Calculate approximate FLOPs for query encoding
+    vocab_size = doc_embeddings.shape[1]
+    avg_tokens_per_query = 10  # Approximate average
+    approx_flops_per_query = vocab_size * avg_tokens_per_query * 2
+    total_query_flops = approx_flops_per_query * len(queries)
+    query_flops_per_sec = total_query_flops / query_encoding_time if query_encoding_time > 0 else 0
+    print(f"✓ Approx query encoding: {total_query_flops / 1e9:.2f} GFLOPs")
+    print(f"✓ Throughput: {query_flops_per_sec / 1e9:.2f} GFLOPs/s")
+    
+    print(f"\n✓ Search/ranking time: {search_time:.2f}s")
+    print(f"✓ Avg search time per query: {search_time / len(queries) * 1000:.2f}ms")
+    print(f"✓ Total latency per query: {(query_encoding_time + search_time) / len(queries) * 1000:.2f}ms")
+    
     return ranked_lists
 
 
