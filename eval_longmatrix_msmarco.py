@@ -33,6 +33,20 @@ except (ImportError, AttributeError) as e:
     print("    Solution 1: Use local TSV files with --queries_file, --collection_file, --qrels_file")
     print("    Solution 2: Fix httpx: pip install --upgrade httpx datasets")
 
+# Try to import optimized BM25 libraries
+try:
+    from rank_bm25 import BM25Okapi
+    _HAS_RANK_BM25 = True
+except ImportError:
+    _HAS_RANK_BM25 = False
+
+try:
+    from pyserini.search.lucene import LuceneSearcher
+    from pyserini.index.lucene import IndexReader
+    _HAS_PYSERINI = True
+except ImportError:
+    _HAS_PYSERINI = False
+
 
 # ========================= Model Definition =========================
 # (Copy from train_longmatrix.py)
@@ -479,8 +493,74 @@ class BM25:
         return ranked_lists
 
 
+class BM25Optimized:
+    """Memory-efficient BM25 using rank-bm25 library (fast, no GPU needed)"""
+    def __init__(self, k1: float = 1.5, b: float = 0.75):
+        if not _HAS_RANK_BM25:
+            raise ImportError(
+                "rank-bm25 not installed. Install with: pip install rank-bm25"
+            )
+        self.k1 = k1
+        self.b = b
+        self.bm25 = None
+        self.passage_ids = []
+        
+    def tokenize(self, text: str) -> List[str]:
+        """Simple whitespace tokenization and lowercasing"""
+        return text.lower().split()
+    
+    def fit(self, passages: Dict[str, str]):
+        """Build BM25 index using rank-bm25"""
+        print("\nBuilding BM25 index (rank-bm25)...")
+        self.passage_ids = list(passages.keys())
+        
+        # Tokenize all documents
+        print("Tokenizing documents...")
+        tokenized_corpus = [
+            self.tokenize(passages[pid]) 
+            for pid in tqdm(self.passage_ids, desc="Tokenizing")
+        ]
+        
+        # Build BM25 index
+        print("Building BM25 index...")
+        self.bm25 = BM25Okapi(tokenized_corpus, k1=self.k1, b=self.b)
+        
+        print(f"✓ Built BM25 index:")
+        print(f"  - {len(self.passage_ids)} documents")
+        print(f"  - Average doc length: {self.bm25.avgdl:.1f}")
+        print(f"  - Memory-efficient inverted index")
+    
+    def retrieve(self, queries: Dict[str, str], passages: Dict[str, str], k: int = 1000) -> Dict[str, List[str]]:
+        """Retrieve top-k passages for each query"""
+        print(f"\nRetrieving with BM25 Optimized (rank-bm25, k1={self.k1}, b={self.b})...")
+        
+        ranked_lists = {}
+        
+        for qid, query in tqdm(queries.items(), desc="Searching with BM25 Optimized"):
+            # Tokenize query
+            query_tokens = self.tokenize(query)
+            
+            # Get scores for all documents
+            scores = self.bm25.get_scores(query_tokens)
+            
+            # Get top-k indices
+            top_k = min(k, len(self.passage_ids))
+            top_k_indices = np.argsort(scores)[::-1][:top_k]
+            
+            # Convert to passage IDs
+            ranked_pids = [self.passage_ids[idx] for idx in top_k_indices]
+            ranked_lists[qid] = ranked_pids
+        
+        print(f"✓ Retrieved results for {len(ranked_lists)} queries")
+        return ranked_lists
+
+
 class BM25CUDA:
-    """GPU-accelerated BM25 using PyTorch for vectorized operations"""
+    """GPU-accelerated BM25 using PyTorch for vectorized operations
+    
+    WARNING: This uses dense matrices and can consume 50-100+ GB of VRAM for large collections!
+    Use BM25Optimized (rank-bm25) instead for memory efficiency.
+    """
     def __init__(self, k1: float = 1.5, b: float = 0.75, device: str = 'cuda'):
         self.k1 = k1
         self.b = b
@@ -492,6 +572,9 @@ class BM25CUDA:
         self.avg_doc_len = 0
         self.N = 0
         self.passage_ids = []
+        
+        print("⚠️  WARNING: BM25CUDA uses dense matrices and may consume 50-100+ GB VRAM!")
+        print("    Consider using --bm25_backend rank_bm25 for memory-efficient alternative.")
         
     def tokenize(self, text: str) -> List[str]:
         """Simple whitespace tokenization and lowercasing"""
@@ -839,6 +922,9 @@ def main():
                         help='BM25 k1 parameter (term saturation)')
     parser.add_argument('--bm25_b', type=float, default=0.75,
                         help='BM25 b parameter (length normalization)')
+    parser.add_argument('--bm25_backend', type=str, default='auto',
+                        choices=['auto', 'rank_bm25', 'cuda', 'cpu'],
+                        help='BM25 backend: auto (rank_bm25 if available), rank_bm25 (memory-efficient), cuda (GPU, high VRAM), cpu (slow)')
     parser.add_argument('--compare_with_bm25', action='store_true',
                         help='Compare LongMatrix results with BM25 baseline')
     
@@ -862,7 +948,18 @@ def main():
     print(f"Device: {args.device}")
     print(f"Batch size: {args.batch_size}")
     print(f"Top-K: {args.k}")
+    if args.use_bm25 or args.compare_with_bm25:
+        print(f"BM25 Backend: {args.bm25_backend}")
+        print(f"BM25 Parameters: k1={args.bm25_k1}, b={args.bm25_b}")
     print("="*70)
+    
+    # Print available BM25 backends
+    if args.use_bm25 or args.compare_with_bm25:
+        print("\n📊 BM25 Backend Availability:")
+        print(f"  - rank_bm25: {'✓ Available (RECOMMENDED)' if _HAS_RANK_BM25 else '✗ Not installed (pip install rank-bm25)'}")
+        print(f"  - CUDA: {'✓ Available (High VRAM!)' if torch.cuda.is_available() else '✗ CUDA not available'}")
+        print(f"  - CPU: ✓ Available (Slow for large collections)")
+        print()
     
     # Load model (skip if using BM25 only)
     model = None
@@ -943,6 +1040,38 @@ def main():
         # Load from Hugging Face
         queries, passages, qrels = load_msmarco_dataset(args.split)
     
+    # Helper function to create BM25 instance
+    def create_bm25(backend='auto'):
+        """Create BM25 instance based on backend choice"""
+        if backend == 'auto':
+            # Auto-select: prefer rank_bm25 if available, otherwise CPU
+            if _HAS_RANK_BM25:
+                print("Using rank-bm25 (memory-efficient, recommended)")
+                return BM25Optimized(k1=args.bm25_k1, b=args.bm25_b)
+            else:
+                print("Using CPU BM25 (may be slow)")
+                print("💡 TIP: Install rank-bm25 for better performance: pip install rank-bm25")
+                return BM25(k1=args.bm25_k1, b=args.bm25_b)
+        
+        elif backend == 'rank_bm25':
+            if not _HAS_RANK_BM25:
+                raise ImportError("rank-bm25 not installed. Install with: pip install rank-bm25")
+            print("Using rank-bm25 (memory-efficient)")
+            return BM25Optimized(k1=args.bm25_k1, b=args.bm25_b)
+        
+        elif backend == 'cuda':
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA not available")
+            print("⚠️  Using BM25 CUDA (WARNING: High VRAM usage!)")
+            return BM25CUDA(k1=args.bm25_k1, b=args.bm25_b, device=args.device)
+        
+        elif backend == 'cpu':
+            print("Using CPU BM25 (may be slow)")
+            return BM25(k1=args.bm25_k1, b=args.bm25_b)
+        
+        else:
+            raise ValueError(f"Unknown backend: {backend}")
+    
     # Perform retrieval
     if args.use_bm25:
         # Use BM25 only
@@ -950,13 +1079,7 @@ def main():
         print("USING BM25 FOR RETRIEVAL")
         print("="*70)
         
-        # Use CUDA-accelerated BM25 if available
-        if args.device == 'cuda' and torch.cuda.is_available():
-            print("Using GPU-accelerated BM25 (CUDA)")
-            bm25 = BM25CUDA(k1=args.bm25_k1, b=args.bm25_b, device=args.device)
-        else:
-            print("Using CPU BM25 (may be slow for large collections)")
-            bm25 = BM25(k1=args.bm25_k1, b=args.bm25_b)
+        bm25 = create_bm25(args.bm25_backend)
         
         bm25.fit(passages)
         ranked_lists = bm25.retrieve(queries, passages, k=args.k)
@@ -975,15 +1098,7 @@ def main():
         
         # Get BM25 results
         print("\n[1/2] Running BM25 baseline...")
-        
-        # Use CUDA-accelerated BM25 if available
-        if args.device == 'cuda' and torch.cuda.is_available():
-            print("Using GPU-accelerated BM25 (CUDA)")
-            bm25 = BM25CUDA(k1=args.bm25_k1, b=args.bm25_b, device=args.device)
-        else:
-            print("Using CPU BM25 (may be slow for large collections)")
-            bm25 = BM25(k1=args.bm25_k1, b=args.bm25_b)
-        
+        bm25 = create_bm25(args.bm25_backend)
         bm25.fit(passages)
         bm25_ranked_lists = bm25.retrieve(queries, passages, k=args.k)
         
