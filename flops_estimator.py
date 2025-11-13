@@ -1,0 +1,281 @@
+"""
+flops_estimator.py
+
+Estimate model size (params), total FLOPs and average FLOPs for encoding the first N
+queries from a `queries.dev.tsv` file.
+
+Supported model types:
+ - splade  : loads sentence_transformers.SparseEncoder(model_name) and uses empirical timing
+ - hf      : loads a HuggingFace transformer (AutoModel) and runs ptflops if available
+ - pt      : loads a local torch .pt file that contains an nn.Module
+
+Behavior:
+ - If `ptflops` is installed and the model is a torch.nn.Module that accepts tensor input,
+   the script will try to compute MACs via ptflops -> FLOPs = 2 * MACs.
+ - Otherwise it will fall back to empirical timing and a simple FLOPs estimate for
+   sparse-style encoders (vocab_size * avg_tokens * 2).
+
+Example:
+  python flops_estimator.py --model "naver/splade-v3" --type splade --num_queries 50
+
+"""
+
+import argparse
+import csv
+import os
+import time
+import math
+from collections import OrderedDict
+
+import torch
+
+
+def load_queries(queries_path, n=50):
+    queries = OrderedDict()
+    with open(queries_path, 'r', encoding='utf-8', newline='') as f:
+        reader = csv.reader(f, delimiter='\t')
+        for row in reader:
+            if len(row) >= 2:
+                try:
+                    qid = int(row[0])
+                except Exception:
+                    # fallback if qid not int
+                    qid = len(queries)
+                queries[qid] = row[1]
+                if len(queries) >= n:
+                    break
+    return queries
+
+
+def count_params(model):
+    try:
+        return sum(p.numel() for p in model.parameters())
+    except Exception:
+        return None
+
+
+def try_ptflops(model, input_res, device):
+    """Try to compute MACs using ptflops.get_model_complexity_info.
+    Returns (macs, params) or (None,None) on failure.
+    """
+    try:
+        from ptflops import get_model_complexity_info
+    except Exception:
+        print("ptflops not installed (pip install ptflops) - skipping precise flops computation.")
+        return None, None
+
+    try:
+        # model should be on device
+        model = model.to(device)
+        # get_model_complexity_info expects a function signature that accepts the tensor size
+        macs, params = get_model_complexity_info(model, input_res, as_strings=False, print_per_layer_stat=False, verbose=False)
+        return macs, params
+    except Exception as e:
+        print(f"ptflops failed: {e}")
+        return None, None
+
+
+def estimate_flops_from_sparse_embedding(embeddings, tokens_counts, encode_time):
+    """Estimate FLOPs for sparse-style embeddings.
+    embeddings: torch.Tensor shape [N, vocab_size]
+    tokens_counts: list of token counts per input (length N)
+    encode_time: total time to encode those N inputs
+    Returns: total_flops_estimate (float), gflops_per_sec empirical (float)
+    """
+    N, vocab_size = embeddings.shape
+    avg_tokens = float(sum(tokens_counts)) / max(1, len(tokens_counts))
+    # naive estimate: vocab_size * avg_tokens * 2 FLOPs per input
+    approx_flops_per_input = vocab_size * avg_tokens * 2
+    total_flops = approx_flops_per_input * N
+    gflops_per_sec = (total_flops / encode_time) / 1e9 if encode_time > 0 else 0.0
+    return total_flops, gflops_per_sec, avg_tokens
+
+
+class HFWrapper(torch.nn.Module):
+    """Wrap a HuggingFace model so ptflops can call forward with input_ids tensor."""
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, input_ids):
+        # input_ids: [B, L]
+        outputs = self.model(input_ids=input_ids)
+        # return logits or last hidden state to let ptflops count operations
+        # Most models return BaseModelOutputWithPoolingAndCrossAttentions or tuple
+        if hasattr(outputs, 'last_hidden_state'):
+            return outputs.last_hidden_state
+        elif isinstance(outputs, (tuple, list)) and len(outputs) > 0:
+            return outputs[0]
+        else:
+            # fallback
+            return outputs
+
+
+def human_readable_params(n):
+    if n is None:
+        return 'unknown'
+    for unit in ['','K','M','B']:
+        if abs(n) < 1000.0:
+            return f"{n:.2f}{unit}"
+        n /= 1000.0
+    return f"{n:.2f}T"
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Estimate FLOPs and params for SPLADE/ColBERT/HF/local models')
+    parser.add_argument('--model', type=str, required=True, help='Model name (HF/splade) or path to .pt')
+    parser.add_argument('--type', choices=['splade','hf','pt'], default='splade', help='Model type')
+    parser.add_argument('--device', choices=['cpu','cuda'], default='cuda', help='Device')
+    parser.add_argument('--queries', type=str, default='queries.dev.tsv', help='Path to queries.dev.tsv')
+    parser.add_argument('--num_queries', type=int, default=50, help='Number of first queries to encode')
+    parser.add_argument('--seq_len', type=int, default=32, help='Sequence length to use for HF ptflops input')
+    parser.add_argument('--batch_size', type=int, default=8, help='Batch size for encoding')
+
+    args = parser.parse_args()
+    device = args.device
+    if device == 'cuda' and not torch.cuda.is_available():
+        print('CUDA not available, falling back to CPU')
+        device = 'cpu'
+
+    queries = load_queries(args.queries, n=args.num_queries)
+    print(f"Loaded {len(queries)} queries from {args.queries}")
+
+    if args.type == 'splade':
+        try:
+            from sentence_transformers import SparseEncoder
+        except Exception as e:
+            print('sentence_transformers not installed. pip install sentence-transformers')
+            return
+
+        print(f"Loading SPLADE model: {args.model}")
+        model = SparseEncoder(args.model)
+        # try to get underlying pytorch module if available for param counting
+        underlying = None
+        if hasattr(model, 'model'):
+            underlying = model.model
+        elif hasattr(model, 'encoder'):
+            underlying = model.encoder
+
+        params = count_params(underlying) if underlying is not None else None
+        print(f"Model params: {human_readable_params(params)}")
+
+        # encode queries empirically
+        texts = list(queries.values())
+        tokens_counts = []
+        t0 = time.time()
+        with torch.no_grad():
+            embeddings = model.encode_query(texts)  # tensor [N, vocab]
+            if device == 'cuda':
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+        t1 = time.time()
+        encode_time = t1 - t0
+        if isinstance(embeddings, (list, tuple)):
+            # some implementations return list; convert to tensor if possible
+            embeddings = torch.stack([e for e in embeddings])
+        if hasattr(model, 'tokenizer'):
+            # count tokens using tokenizer
+            for q in texts:
+                try:
+                    tokens = model.tokenizer.tokenize(q)
+                    tokens_counts.append(len(tokens))
+                except Exception:
+                    tokens_counts.append(10)
+        else:
+            tokens_counts = [10] * len(texts)
+
+        # embeddings may be numpy
+        if hasattr(embeddings, 'shape'):
+            emb_shape = embeddings.shape
+        else:
+            emb_shape = (len(texts), 0)
+        if isinstance(embeddings, torch.Tensor):
+            total_flops, gflops_per_sec, avg_tokens = estimate_flops_from_sparse_embedding(embeddings, tokens_counts, encode_time)
+            print(f"Encoded {len(texts)} queries in {encode_time:.4f}s -> avg {encode_time/len(texts)*1000:.4f} ms/query")
+            print(f"Embedding shape: {emb_shape}")
+            print(f"Estimated avg tokens/query: {avg_tokens:.2f}")
+            print(f"Estimated total FLOPs for {len(texts)} queries: {total_flops/1e9:.4f} GFLOPs")
+            print(f"Estimated GFLOPs/s (empirical): {gflops_per_sec:.4f}")
+        else:
+            print("Could not interpret embeddings shape; skipping sparse FLOPs estimate.")
+
+    elif args.type == 'hf':
+        try:
+            from transformers import AutoModel, AutoTokenizer
+        except Exception as e:
+            print('transformers not installed. pip install transformers')
+            return
+
+        print(f"Loading HF model: {args.model}")
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        model = AutoModel.from_pretrained(args.model)
+        params = count_params(model)
+        print(f"Model params: {human_readable_params(params)}")
+
+        # try ptflops
+        wrapper = HFWrapper(model)
+        input_res = (args.seq_len,)  # sequence length
+        macs, params_pt = try_ptflops(wrapper, input_res, device)
+        if macs is not None:
+            flops = 2 * macs
+            print(f"PTFLOPS MACs: {macs:,}")
+            print(f"Approx FLOPs (2*MACs): {flops:,} ({flops/1e9:.4f} GFLOPs)")
+        else:
+            print("ptflops result not available; skipping precise flops computation.")
+
+        # empirical encoding of first N queries
+        texts = list(queries.values())
+        enc_inputs = tokenizer(texts, padding=True, truncation=True, max_length=args.seq_len, return_tensors='pt')
+        input_ids = enc_inputs['input_ids'].to(device)
+        model = model.to(device)
+        model.eval()
+        t0 = time.time()
+        with torch.no_grad():
+            out = model(input_ids=input_ids)
+            if device == 'cuda':
+                torch.cuda.synchronize()
+        t1 = time.time()
+        enc_time = t1 - t0
+        print(f"Encoded {len(texts)} queries in {enc_time:.4f}s -> avg {enc_time/len(texts)*1000:.4f} ms/query")
+
+    elif args.type == 'pt':
+        # load a local .pt which should contain an nn.Module
+        path = args.model
+        if not os.path.exists(path):
+            print(f"File not found: {path}")
+            return
+        print(f"Loading local .pt module: {path}")
+        obj = torch.load(path, map_location=device)
+        if isinstance(obj, torch.nn.Module):
+            model = obj
+        elif isinstance(obj, dict) and 'state_dict' in obj:
+            print('The loaded file is a state_dict; please provide a script that constructs the nn.Module and loads the state_dict.')
+            return
+        else:
+            print('Unsupported .pt file content. Expect a saved nn.Module or checkpoint dict with state_dict.')
+            return
+
+        params = count_params(model)
+        print(f"Model params: {human_readable_params(params)}")
+        # try ptflops
+        wrapper = model
+        # try input_res approximate
+        input_res = (args.seq_len,)
+        macs, params_pt = try_ptflops(wrapper, input_res, device)
+        if macs is not None:
+            flops = 2 * macs
+            print(f"PTFLOPS MACs: {macs:,}")
+            print(f"Approx FLOPs (2*MACs): {flops:,} ({flops/1e9:.4f} GFLOPs)")
+
+        # If module has encoder that accepts text, user must adapt script to perform empirical measurement.
+
+    else:
+        print('Unknown model type')
+
+    print('\nDone.')
+
+
+if __name__ == '__main__':
+    main()
