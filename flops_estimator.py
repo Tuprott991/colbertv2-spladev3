@@ -54,9 +54,15 @@ def count_params(model):
         return None
 
 
-def try_ptflops(model, input_res, device):
+def try_ptflops(model, input_res, device, batch_size=1):
     """Try to compute MACs using ptflops.get_model_complexity_info.
     Returns (macs, params) or (None,None) on failure.
+    
+    Args:
+        model: The model to analyze
+        input_res: Input resolution (e.g., (seq_len,))
+        device: Device to run on
+        batch_size: Batch size for FLOPs calculation (default=1 for per-query cost)
     """
     try:
         from ptflops import get_model_complexity_info
@@ -71,12 +77,11 @@ def try_ptflops(model, input_res, device):
         # For embedding models, we need to use input_constructor to generate integer tensors
         def input_constructor(input_shape):
             # input_shape is a tuple like (seq_len,)
-            # Return a dict or tuple that can be passed to model.forward()
-            batch_size = 1
+            # Return tensor as positional argument so ptflops can detect batch size
             seq_len = input_shape[0]
             # Generate random integer tensor for input_ids
             input_ids = torch.randint(0, 30522, (batch_size, seq_len), dtype=torch.long, device=device)
-            return {'input_ids': input_ids}
+            return input_ids
         
         macs, params = get_model_complexity_info(
             model, 
@@ -114,15 +119,8 @@ class HFWrapper(torch.nn.Module):
         super().__init__()
         self.model = model
 
-    def forward(self, input_ids=None, **kwargs):
-        # Handle both dict input from input_constructor and direct tensor input
-        if input_ids is None and 'input_ids' in kwargs:
-            input_ids = kwargs['input_ids']
-        elif isinstance(input_ids, dict):
-            # If first arg is a dict (from input_constructor), extract input_ids
-            input_ids = input_ids['input_ids']
-        
-        # input_ids: [B, L]
+    def forward(self, input_ids):
+        # input_ids: [B, L] - tensor passed as positional argument from input_constructor
         outputs = self.model(input_ids=input_ids)
         # return logits or last hidden state to let ptflops count operations
         # Most models return BaseModelOutputWithPoolingAndCrossAttentions or tuple
@@ -154,6 +152,7 @@ def main():
     parser.add_argument('--num_queries', type=int, default=50, help='Number of first queries to encode')
     parser.add_argument('--seq_len', type=int, default=32, help='Sequence length to use for HF ptflops input')
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size for encoding')
+    parser.add_argument('--flops_batch_size', type=int, default=1, help='Batch size for FLOPs calculation (default=1 for per-query cost)')
 
     args = parser.parse_args()
     device = args.device
@@ -241,11 +240,13 @@ def main():
         # try ptflops
         wrapper = HFWrapper(model)
         input_res = (args.seq_len,)  # sequence length
-        macs, params_pt = try_ptflops(wrapper, input_res, device)
+        macs, params_pt = try_ptflops(wrapper, input_res, device, batch_size=args.flops_batch_size)
         if macs is not None:
             flops = 2 * macs
-            print(f"PTFLOPS MACs: {macs:,}")
+            print(f"PTFLOPS MACs (batch_size={args.flops_batch_size}): {macs:,}")
             print(f"Approx FLOPs (2*MACs): {flops:,} ({flops/1e9:.4f} GFLOPs)")
+            if args.flops_batch_size > 1:
+                print(f"FLOPs per query: {flops/args.flops_batch_size:,} ({flops/args.flops_batch_size/1e9:.4f} GFLOPs)")
         else:
             print("ptflops result not available; skipping precise flops computation.")
 
@@ -287,11 +288,13 @@ def main():
         wrapper = model
         # try input_res approximate
         input_res = (args.seq_len,)
-        macs, params_pt = try_ptflops(wrapper, input_res, device)
+        macs, params_pt = try_ptflops(wrapper, input_res, device, batch_size=args.flops_batch_size)
         if macs is not None:
             flops = 2 * macs
-            print(f"PTFLOPS MACs: {macs:,}")
+            print(f"PTFLOPS MACs (batch_size={args.flops_batch_size}): {macs:,}")
             print(f"Approx FLOPs (2*MACs): {flops:,} ({flops/1e9:.4f} GFLOPs)")
+            if args.flops_batch_size > 1:
+                print(f"FLOPs per query: {flops/args.flops_batch_size:,} ({flops/args.flops_batch_size/1e9:.4f} GFLOPs)")
 
         # If module has encoder that accepts text, user must adapt script to perform empirical measurement.
 
