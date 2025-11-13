@@ -292,7 +292,13 @@ def main():
                     print("checkpoint['model'] contains a state_dict")
                     # Try to infer model from args if available
                     if 'args' in obj:
-                        print(f"Checkpoint args: {obj['args']}")
+                        # Print only summary of args to avoid dumping large data
+                        args_obj = obj['args']
+                        if hasattr(args_obj, '__dict__'):
+                            print(f"Checkpoint has args with type: {type(args_obj).__name__}")
+                        else:
+                            print(f"Checkpoint has args of type: {type(args_obj)}")
+                        
                         # Try to load using ColBERT's checkpoint loader
                         try:
                             from colbert.modeling.checkpoint import Checkpoint
