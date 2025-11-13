@@ -198,6 +198,16 @@ def main():
             underlying = model.model
         elif hasattr(model, 'encoder'):
             underlying = model.encoder
+        # Also try the transformer model inside SentenceTransformer
+        if underlying is None and hasattr(model, '_first_module'):
+            underlying = model._first_module()
+        if underlying is None and hasattr(model, 'modules') and callable(model.modules):
+            try:
+                mods = list(model.modules())
+                if len(mods) > 1:
+                    underlying = mods[1]  # First real module after wrapper
+            except Exception:
+                pass
 
         params = count_params(underlying) if underlying is not None else None
         print(f"Model params: {human_readable_params(params)}")
@@ -236,11 +246,16 @@ def main():
             emb_shape = (len(texts), 0)
         if isinstance(embeddings, torch.Tensor):
             total_flops, gflops_per_sec, avg_tokens = estimate_flops_from_sparse_embedding(embeddings, tokens_counts, encode_time)
-            print(f"Encoded {len(texts)} queries in {encode_time:.4f}s -> avg {encode_time/len(texts)*1000:.4f} ms/query")
+            print(f"\n--- Performance Metrics ---")
             print(f"Embedding shape: {emb_shape}")
             print(f"Estimated avg tokens/query: {avg_tokens:.2f}")
-            print(f"Estimated total FLOPs for {len(texts)} queries: {total_flops/1e9:.4f} GFLOPs")
-            print(f"Estimated GFLOPs/s (empirical): {gflops_per_sec:.4f}")
+            print(f"FLOPs per query (estimated): {total_flops/len(texts):,.0f} ({total_flops/len(texts)/1e9:.4f} GFLOPs)")
+            print(f"Total FLOPs for {len(texts)} queries: {total_flops/1e9:.4f} GFLOPs")
+            print(f"\n--- Encoding Speed ---")
+            print(f"Encoded {len(texts)} queries in {encode_time:.4f}s")
+            print(f"Throughput: {len(texts)/encode_time:.2f} queries/sec")
+            print(f"Latency: {encode_time/len(texts)*1000:.4f} ms/query")
+            print(f"Empirical GFLOPs/s: {gflops_per_sec:.4f}")
         else:
             print("Could not interpret embeddings shape; skipping sparse FLOPs estimate.")
 
@@ -261,14 +276,16 @@ def main():
         wrapper = HFWrapper(model)
         input_res = (args.seq_len,)  # sequence length
         macs, params_pt = try_ptflops(wrapper, input_res, device, batch_size=args.flops_batch_size)
+        
+        print(f"\n--- Performance Metrics ---")
         if macs is not None:
             flops = 2 * macs
-            print(f"PTFLOPS MACs (batch_size={args.flops_batch_size}): {macs:,}")
-            print(f"Approx FLOPs (2*MACs): {flops:,} ({flops/1e9:.4f} GFLOPs)")
+            flops_per_query = flops / args.flops_batch_size if args.flops_batch_size > 1 else flops
+            print(f"FLOPs per query (ptflops): {flops_per_query:,.0f} ({flops_per_query/1e9:.4f} GFLOPs)")
             if args.flops_batch_size > 1:
-                print(f"FLOPs per query: {flops/args.flops_batch_size:,} ({flops/args.flops_batch_size/1e9:.4f} GFLOPs)")
+                print(f"Total FLOPs for batch_size={args.flops_batch_size}: {flops:,} ({flops/1e9:.4f} GFLOPs)")
         else:
-            print("ptflops result not available; skipping precise flops computation.")
+            print("FLOPs estimation not available (ptflops failed)")
 
         # empirical encoding of first N queries
         texts = list(queries.values())
@@ -276,6 +293,8 @@ def main():
         input_ids = enc_inputs['input_ids'].to(device)
         model = model.to(device)
         model.eval()
+        
+        print(f"\n--- Encoding Speed ---")
         t0 = time.time()
         with torch.no_grad():
             out = model(input_ids=input_ids)
@@ -283,7 +302,12 @@ def main():
                 torch.cuda.synchronize()
         t1 = time.time()
         enc_time = t1 - t0
-        print(f"Encoded {len(texts)} queries in {enc_time:.4f}s -> avg {enc_time/len(texts)*1000:.4f} ms/query")
+        print(f"Encoded {len(texts)} queries in {enc_time:.4f}s")
+        print(f"Throughput: {len(texts)/enc_time:.2f} queries/sec")
+        print(f"Latency: {enc_time/len(texts)*1000:.4f} ms/query")
+        if macs is not None:
+            empirical_gflops_per_sec = (flops_per_query * len(texts) / enc_time) / 1e9
+            print(f"Empirical GFLOPs/s: {empirical_gflops_per_sec:.4f}")
 
     elif args.type == 'pt':
         # load a local .pt which should contain an nn.Module
@@ -413,14 +437,39 @@ def main():
         # try input_res approximate
         input_res = (args.seq_len,)
         macs, params_pt = try_ptflops(wrapper, input_res, device, batch_size=args.flops_batch_size)
+        
+        print(f"\n--- Performance Metrics ---")
         if macs is not None:
             flops = 2 * macs
-            print(f"PTFLOPS MACs (batch_size={args.flops_batch_size}): {macs:,}")
-            print(f"Approx FLOPs (2*MACs): {flops:,} ({flops/1e9:.4f} GFLOPs)")
+            flops_per_query = flops / args.flops_batch_size if args.flops_batch_size > 1 else flops
+            print(f"FLOPs per query (ptflops): {flops_per_query:,.0f} ({flops_per_query/1e9:.4f} GFLOPs)")
             if args.flops_batch_size > 1:
-                print(f"FLOPs per query: {flops/args.flops_batch_size:,} ({flops/args.flops_batch_size/1e9:.4f} GFLOPs)")
+                print(f"Total FLOPs for batch_size={args.flops_batch_size}: {flops:,} ({flops/1e9:.4f} GFLOPs)")
+        else:
+            print("FLOPs estimation not available (ptflops failed)")
 
-        # If module has encoder that accepts text, user must adapt script to perform empirical measurement.
+        # Empirical encoding if LongMatrix
+        if is_longmatrix:
+            texts = list(queries.values())
+            tok = model.tokenizer if hasattr(model, 'tokenizer') else tokenizer
+            enc_inputs = tok(texts, padding=True, truncation=True, max_length=args.max_len, return_tensors='pt')
+            enc_inputs = {k: v.to(device) for k, v in enc_inputs.items()}
+            model.eval()
+            
+            print(f"\n--- Encoding Speed ---")
+            t0 = time.time()
+            with torch.no_grad():
+                out = model.encode(enc_inputs, topk_tokens=1)
+                if device == 'cuda':
+                    torch.cuda.synchronize()
+            t1 = time.time()
+            enc_time = t1 - t0
+            print(f"Encoded {len(texts)} queries in {enc_time:.4f}s")
+            print(f"Throughput: {len(texts)/enc_time:.2f} queries/sec")
+            print(f"Latency: {enc_time/len(texts)*1000:.4f} ms/query")
+            if macs is not None:
+                empirical_gflops_per_sec = (flops_per_query * len(texts) / enc_time) / 1e9
+                print(f"Empirical GFLOPs/s: {empirical_gflops_per_sec:.4f}")
 
     else:
         print('Unknown model type')
