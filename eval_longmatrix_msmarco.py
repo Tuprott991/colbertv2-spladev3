@@ -479,6 +479,173 @@ class BM25:
         return ranked_lists
 
 
+class BM25CUDA:
+    """GPU-accelerated BM25 using PyTorch for vectorized operations"""
+    def __init__(self, k1: float = 1.5, b: float = 0.75, device: str = 'cuda'):
+        self.k1 = k1
+        self.b = b
+        self.device = device
+        self.vocab = {}  # token -> index
+        self.idf = None  # tensor of IDF scores
+        self.doc_term_freqs = None  # sparse matrix of term frequencies
+        self.doc_lens = None  # tensor of document lengths
+        self.avg_doc_len = 0
+        self.N = 0
+        self.passage_ids = []
+        
+    def tokenize(self, text: str) -> List[str]:
+        """Simple whitespace tokenization and lowercasing"""
+        return text.lower().split()
+    
+    def fit(self, passages: Dict[str, str]):
+        """Build BM25 index with GPU-friendly structures"""
+        print(f"\nBuilding BM25 CUDA index on {self.device}...")
+        self.N = len(passages)
+        self.passage_ids = list(passages.keys())
+        
+        # Build vocabulary and document representations
+        print("Building vocabulary...")
+        all_tokens = []
+        doc_tokens_list = []
+        
+        for pid in tqdm(self.passage_ids, desc="Tokenizing"):
+            tokens = self.tokenize(passages[pid])
+            doc_tokens_list.append(tokens)
+            all_tokens.extend(set(tokens))
+        
+        # Create vocab: token -> index
+        unique_tokens = sorted(set(all_tokens))
+        self.vocab = {token: idx for idx, token in enumerate(unique_tokens)}
+        vocab_size = len(self.vocab)
+        
+        print(f"✓ Vocabulary size: {vocab_size}")
+        
+        # Build term frequency matrix and calculate IDF
+        print("Building term frequency matrix...")
+        doc_lens = []
+        df = torch.zeros(vocab_size, dtype=torch.float32)
+        
+        # Store as list of dicts for now (will convert to tensor later)
+        doc_tf_dicts = []
+        
+        for tokens in tqdm(doc_tokens_list, desc="Processing documents"):
+            doc_lens.append(len(tokens))
+            
+            # Count term frequencies
+            tf_dict = defaultdict(int)
+            unique_in_doc = set()
+            
+            for token in tokens:
+                if token in self.vocab:
+                    idx = self.vocab[token]
+                    tf_dict[idx] += 1
+                    unique_in_doc.add(idx)
+            
+            # Update document frequency
+            for idx in unique_in_doc:
+                df[idx] += 1
+            
+            doc_tf_dicts.append(tf_dict)
+        
+        # Calculate IDF scores
+        print("Calculating IDF scores...")
+        idf = torch.log((self.N - df + 0.5) / (df + 0.5) + 1)
+        self.idf = idf.to(self.device)
+        
+        # Calculate average document length
+        self.doc_lens = torch.tensor(doc_lens, dtype=torch.float32).to(self.device)
+        self.avg_doc_len = self.doc_lens.mean().item()
+        
+        # Create sparse term frequency matrix
+        print("Creating sparse TF matrix...")
+        # We'll store as dense for simplicity (can optimize with sparse tensors if needed)
+        tf_matrix = torch.zeros(self.N, vocab_size, dtype=torch.float32)
+        
+        for doc_idx, tf_dict in enumerate(tqdm(doc_tf_dicts, desc="Building TF matrix")):
+            for term_idx, freq in tf_dict.items():
+                tf_matrix[doc_idx, term_idx] = freq
+        
+        self.doc_term_freqs = tf_matrix.to(self.device)
+        
+        print(f"✓ Built BM25 CUDA index:")
+        print(f"  - {self.N} documents")
+        print(f"  - Vocab size: {vocab_size}")
+        print(f"  - Avg doc length: {self.avg_doc_len:.1f}")
+        print(f"  - Device: {self.device}")
+        print(f"  - TF matrix shape: {self.doc_term_freqs.shape}")
+        print(f"  - Memory: {self.doc_term_freqs.element_size() * self.doc_term_freqs.nelement() / 1e9:.2f} GB")
+    
+    @torch.no_grad()
+    def score_batch(self, query_term_indices: List[int]) -> torch.Tensor:
+        """Calculate BM25 scores for all documents given a query"""
+        # Get term frequencies for query terms across all documents
+        # query_term_indices: list of vocab indices
+        
+        if len(query_term_indices) == 0:
+            return torch.zeros(self.N, dtype=torch.float32, device=self.device)
+        
+        # Get TF for query terms: (N, len(query_terms))
+        query_tfs = self.doc_term_freqs[:, query_term_indices]
+        
+        # Get IDF for query terms: (len(query_terms),)
+        query_idfs = self.idf[query_term_indices]
+        
+        # Calculate BM25 score
+        # BM25 = sum over terms: idf * (tf * (k1+1)) / (tf + k1 * (1-b + b*dl/avgdl))
+        
+        # Denominator: tf + k1 * (1 - b + b * dl / avgdl)
+        # dl is doc_lens (N,), need to broadcast
+        doc_lens_expanded = self.doc_lens.unsqueeze(1)  # (N, 1)
+        
+        # k1 * (1 - b + b * dl / avgdl)
+        length_norm = self.k1 * (1 - self.b + self.b * doc_lens_expanded / self.avg_doc_len)
+        
+        # Denominator for each term
+        denominators = query_tfs + length_norm  # (N, len(query_terms))
+        
+        # Numerator
+        numerators = query_tfs * (self.k1 + 1)  # (N, len(query_terms))
+        
+        # BM25 component for each term
+        term_scores = (numerators / denominators) * query_idfs.unsqueeze(0)  # (N, len(query_terms))
+        
+        # Sum over terms
+        scores = term_scores.sum(dim=1)  # (N,)
+        
+        return scores
+    
+    def retrieve(self, queries: Dict[str, str], passages: Dict[str, str], k: int = 1000) -> Dict[str, List[str]]:
+        """Retrieve top-k passages for each query using GPU acceleration"""
+        print(f"\nRetrieving with BM25 CUDA (k1={self.k1}, b={self.b}, device={self.device})...")
+        
+        ranked_lists = {}
+        
+        for qid, query in tqdm(queries.items(), desc="Searching with BM25 CUDA"):
+            # Tokenize query and convert to vocab indices
+            query_tokens = self.tokenize(query)
+            query_term_indices = [self.vocab[token] for token in query_tokens if token in self.vocab]
+            
+            if len(query_term_indices) == 0:
+                # No terms in vocabulary, return empty
+                ranked_lists[qid] = []
+                continue
+            
+            # Calculate scores for all documents
+            scores = self.score_batch(query_term_indices)
+            
+            # Get top-k
+            top_k = min(k, len(self.passage_ids))
+            top_k_scores, top_k_indices = torch.topk(scores, k=top_k)
+            
+            # Convert to passage IDs
+            top_k_indices = top_k_indices.cpu().tolist()
+            ranked_pids = [self.passage_ids[idx] for idx in top_k_indices]
+            ranked_lists[qid] = ranked_pids
+        
+        print(f"✓ Retrieved results for {len(ranked_lists)} queries")
+        return ranked_lists
+
+
 # ========================= Retrieval =========================
 
 @torch.no_grad()
@@ -782,7 +949,15 @@ def main():
         print("\n" + "="*70)
         print("USING BM25 FOR RETRIEVAL")
         print("="*70)
-        bm25 = BM25(k1=args.bm25_k1, b=args.bm25_b)
+        
+        # Use CUDA-accelerated BM25 if available
+        if args.device == 'cuda' and torch.cuda.is_available():
+            print("Using GPU-accelerated BM25 (CUDA)")
+            bm25 = BM25CUDA(k1=args.bm25_k1, b=args.bm25_b, device=args.device)
+        else:
+            print("Using CPU BM25 (may be slow for large collections)")
+            bm25 = BM25(k1=args.bm25_k1, b=args.bm25_b)
+        
         bm25.fit(passages)
         ranked_lists = bm25.retrieve(queries, passages, k=args.k)
         
@@ -800,7 +975,15 @@ def main():
         
         # Get BM25 results
         print("\n[1/2] Running BM25 baseline...")
-        bm25 = BM25(k1=args.bm25_k1, b=args.bm25_b)
+        
+        # Use CUDA-accelerated BM25 if available
+        if args.device == 'cuda' and torch.cuda.is_available():
+            print("Using GPU-accelerated BM25 (CUDA)")
+            bm25 = BM25CUDA(k1=args.bm25_k1, b=args.bm25_b, device=args.device)
+        else:
+            print("Using CPU BM25 (may be slow for large collections)")
+            bm25 = BM25(k1=args.bm25_k1, b=args.bm25_b)
+        
         bm25.fit(passages)
         bm25_ranked_lists = bm25.retrieve(queries, passages, k=args.k)
         
