@@ -273,13 +273,35 @@ def main():
             return
         print(f"Loading local .pt module: {path}")
         obj = torch.load(path, map_location=device)
+        
+        # Debug: print what we loaded
+        print(f"Loaded object type: {type(obj)}")
+        if isinstance(obj, dict):
+            print(f"Dict keys: {list(obj.keys())}")
+        
         if isinstance(obj, torch.nn.Module):
             model = obj
-        elif isinstance(obj, dict) and 'state_dict' in obj:
-            print('The loaded file is a state_dict; please provide a script that constructs the nn.Module and loads the state_dict.')
-            return
+        elif isinstance(obj, dict):
+            # Try common checkpoint formats
+            if 'model' in obj and isinstance(obj['model'], torch.nn.Module):
+                model = obj['model']
+                print("Loaded model from checkpoint['model']")
+            elif 'state_dict' in obj:
+                print('The loaded file contains a state_dict. Please provide the model architecture or use --type hf/splade.')
+                print('Available keys in checkpoint:', list(obj.keys()))
+                return
+            elif 'model_state_dict' in obj:
+                print('The loaded file contains a model_state_dict. Please provide the model architecture or use --type hf/splade.')
+                print('Available keys in checkpoint:', list(obj.keys()))
+                return
+            else:
+                # Maybe it's a plain state dict without wrapper
+                print('The loaded dict does not contain a model or recognizable state_dict key.')
+                print('Available keys:', list(obj.keys()))
+                return
         else:
-            print('Unsupported .pt file content. Expect a saved nn.Module or checkpoint dict with state_dict.')
+            print(f'Unsupported .pt file content type: {type(obj)}')
+            print('Expect a saved nn.Module or checkpoint dict with model/state_dict.')
             return
 
         params = count_params(model)
