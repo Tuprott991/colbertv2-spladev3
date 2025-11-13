@@ -451,25 +451,28 @@ def main():
         # Empirical encoding if LongMatrix
         if is_longmatrix:
             texts = list(queries.values())
-            tok = model.tokenizer if hasattr(model, 'tokenizer') else tokenizer
-            enc_inputs = tok(texts, padding=True, truncation=True, max_length=args.max_len, return_tensors='pt')
-            enc_inputs = {k: v.to(device) for k, v in enc_inputs.items()}
-            model.eval()
-            
-            print(f"\n--- Encoding Speed ---")
-            t0 = time.time()
-            with torch.no_grad():
-                out = model.encode(enc_inputs, topk_tokens=1)
-                if device == 'cuda':
-                    torch.cuda.synchronize()
-            t1 = time.time()
-            enc_time = t1 - t0
-            print(f"Encoded {len(texts)} queries in {enc_time:.4f}s")
-            print(f"Throughput: {len(texts)/enc_time:.2f} queries/sec")
-            print(f"Latency: {enc_time/len(texts)*1000:.4f} ms/query")
-            if macs is not None:
-                empirical_gflops_per_sec = (flops_per_query * len(texts) / enc_time) / 1e9
-                print(f"Empirical GFLOPs/s: {empirical_gflops_per_sec:.4f}")
+            tok = model.tokenizer if hasattr(model, 'tokenizer') else None
+            if tok is None:
+                print("\nWarning: LongMatrix model has no tokenizer, skipping empirical encoding")
+            else:
+                enc_inputs = tok(texts, padding=True, truncation=True, max_length=args.seq_len, return_tensors='pt')
+                enc_inputs = {k: v.to(device) for k, v in enc_inputs.items()}
+                model.eval()
+                
+                print(f"\n--- Encoding Speed ---")
+                t0 = time.time()
+                with torch.no_grad():
+                    out = model.encode(enc_inputs, topk_tokens=1)
+                    if device == 'cuda':
+                        torch.cuda.synchronize()
+                t1 = time.time()
+                enc_time = t1 - t0
+                print(f"Encoded {len(texts)} queries in {enc_time:.4f}s")
+                print(f"Throughput: {len(texts)/enc_time:.2f} queries/sec")
+                print(f"Latency: {enc_time/len(texts)*1000:.4f} ms/query")
+                if macs is not None:
+                    empirical_gflops_per_sec = (flops_per_query * len(texts) / enc_time) / 1e9
+                    print(f"Empirical GFLOPs/s: {empirical_gflops_per_sec:.4f}")
 
     else:
         print('Unknown model type')
