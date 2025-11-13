@@ -3,6 +3,11 @@ import csv
 from collections import defaultdict
 import numpy as np
 import torch
+import argparse
+import requests
+import gzip
+import shutil
+from tqdm import tqdm
 
 # Import ColBERTv2 code-base (adjust path if installed differently)
 from colbert.infra import Run, RunConfig, ColBERTConfig
@@ -58,25 +63,152 @@ def evaluate_all(ranked_lists, qrels):
         print(f"MRR@{K:2d}    = {mrr:.4f}")
         print("-"*60)
 
+
+def download_file(url, output_path, description="Downloading"):
+    """Download file with progress bar."""
+    print(f"{description}: {url}")
+    response = requests.get(url, stream=True)
+    response.raise_for_status()
+    
+    total_size = int(response.headers.get('content-length', 0))
+    
+    with open(output_path, 'wb') as f:
+        if total_size == 0:
+            f.write(response.content)
+        else:
+            with tqdm(total=total_size, unit='B', unit_scale=True, desc=description) as pbar:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+                    pbar.update(len(chunk))
+    
+    print(f"✓ Saved to: {output_path}\n")
+
+
+def decompress_gz(gz_path, output_path):
+    """Decompress .gz file."""
+    print(f"Decompressing: {gz_path}")
+    with gzip.open(gz_path, 'rb') as f_in:
+        with open(output_path, 'wb') as f_out:
+            shutil.copyfileobj(f_in, f_out)
+    print(f"✓ Decompressed to: {output_path}\n")
+
+
+def download_msmarco_dev(base_dir):
+    """
+    Download MS MARCO passage ranking dev set (small version for testing).
+    
+    Files:
+    - collection.tsv: ~8.8M passages
+    - queries.dev.small.tsv: 6,980 queries
+    - qrels.dev.small.tsv: relevance judgments
+    
+    This is a much harder dataset than the toy dataset.
+    """
+    print("\n" + "="*60)
+    print("DOWNLOADING MS MARCO DEV DATASET (SMALL)")
+    print("="*60)
+    
+    msmarco_dir = os.path.join(base_dir, "msmarco_data")
+    os.makedirs(msmarco_dir, exist_ok=True)
+    
+    # MS MARCO URLs
+    base_url = "https://msmarco.blob.core.windows.net/msmarcoranking"
+    
+    files_to_download = [
+        {
+            "url": f"{base_url}/collection.tar.gz",
+            "compressed": os.path.join(msmarco_dir, "collection.tar.gz"),
+            "final": os.path.join(msmarco_dir, "collection.tsv"),
+            "is_tar": True
+        },
+        {
+            "url": f"{base_url}/queries.dev.small.tar.gz",
+            "compressed": os.path.join(msmarco_dir, "queries.dev.small.tar.gz"),
+            "final": os.path.join(msmarco_dir, "queries.dev.small.tsv"),
+            "is_tar": True
+        },
+        {
+            "url": f"{base_url}/qrels.dev.small.tsv",
+            "final": os.path.join(msmarco_dir, "qrels.dev.small.tsv"),
+            "is_tar": False
+        }
+    ]
+    
+    for file_info in files_to_download:
+        final_path = file_info["final"]
+        
+        # Check if already exists
+        if os.path.exists(final_path):
+            print(f"✓ Already exists: {final_path}")
+            continue
+        
+        # Download
+        if file_info["is_tar"]:
+            compressed_path = file_info["compressed"]
+            if not os.path.exists(compressed_path):
+                download_file(file_info["url"], compressed_path, 
+                            description=f"Downloading {os.path.basename(compressed_path)}")
+            
+            # Extract tar.gz
+            print(f"Extracting: {compressed_path}")
+            import tarfile
+            with tarfile.open(compressed_path, 'r:gz') as tar:
+                tar.extractall(path=msmarco_dir)
+            print(f"✓ Extracted to: {msmarco_dir}\n")
+        else:
+            download_file(file_info["url"], final_path,
+                        description=f"Downloading {os.path.basename(final_path)}")
+    
+    print("="*60)
+    print("MS MARCO DATASET READY")
+    print("="*60)
+    print(f"Collection: {os.path.join(msmarco_dir, 'collection.tsv')}")
+    print(f"Queries: {os.path.join(msmarco_dir, 'queries.dev.small.tsv')}")
+    print(f"Qrels: {os.path.join(msmarco_dir, 'qrels.dev.small.tsv')}")
+    print("="*60 + "\n")
+    
+    return {
+        "collection": os.path.join(msmarco_dir, "collection.tsv"),
+        "queries": os.path.join(msmarco_dir, "queries.dev.small.tsv"),
+        "qrels": os.path.join(msmarco_dir, "qrels.dev.small.tsv"),
+        "index_name": "msmarco_colbertv2_index"
+    }
+
+
 def main():
-    # Paths — adjust to your environment
-    # You can also pass these as command line arguments
-    import sys
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='ColBERTv2 Evaluation Script')
+    parser.add_argument('--msmarco', action='store_true', 
+                       help='Download and use MS MARCO dev dataset instead of local test data')
+    parser.add_argument('--base-dir', type=str, default='./',
+                       help='Base directory for data and experiments')
+    parser.add_argument('--checkpoint', type=str, default='colbert-ir/colbertv2.0',
+                       help='ColBERT checkpoint path or HuggingFace repo id')
+    args = parser.parse_args()
     
-    base_dir = r"./"
+    base_dir = args.base_dir
+    colbert_ckpt = args.checkpoint
     
-    # Default checkpoint: use the HF repo id (will download if not present).
-    # If you already downloaded a local checkpoint tar.gz, set `colbert_ckpt` to its path.
-    # Notes:
-    # - Public repo id: 'colbert-ir/colbertv2.0' (recommended).
-    # - If the repo is private or gated, authenticate with `huggingface-cli login`
-    #   or set the env var HUGGINGFACE_HUB_TOKEN.
-    colbert_ckpt = r"colbert-ir/colbertv2.0"  
-    collection_path = os.path.join(base_dir, "collection.tsv")
-    queries_path    = os.path.join(base_dir, "queries.dev.tsv")
-    qrels_path      = os.path.join(base_dir, "qrels.dev.tsv")
-    index_name      = "test_colbertv2_index"
-    root            = os.path.join(base_dir, "experiments")
+    # Determine which dataset to use
+    if args.msmarco:
+        print("\n" + "="*60)
+        print("MS MARCO MODE SELECTED")
+        print("="*60)
+        dataset_info = download_msmarco_dev(base_dir)
+        collection_path = dataset_info["collection"]
+        queries_path = dataset_info["queries"]
+        qrels_path = dataset_info["qrels"]
+        index_name = dataset_info["index_name"]
+    else:
+        print("\n" + "="*60)
+        print("LOCAL TEST DATA MODE")
+        print("="*60)
+        collection_path = os.path.join(base_dir, "collection.tsv")
+        queries_path = os.path.join(base_dir, "queries.dev.tsv")
+        qrels_path = os.path.join(base_dir, "qrels.dev.tsv")
+        index_name = "test_colbertv2_index"
+    
+    root = os.path.join(base_dir, "experiments")
     
     # Check if required files exist
     print("Checking required files...")
