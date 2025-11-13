@@ -283,9 +283,32 @@ def main():
             model = obj
         elif isinstance(obj, dict):
             # Try common checkpoint formats
-            if 'model' in obj and isinstance(obj['model'], torch.nn.Module):
-                model = obj['model']
-                print("Loaded model from checkpoint['model']")
+            if 'model' in obj:
+                if isinstance(obj['model'], torch.nn.Module):
+                    model = obj['model']
+                    print("Loaded model from checkpoint['model']")
+                elif isinstance(obj['model'], dict):
+                    # It's a state dict - try to reconstruct the model
+                    print("checkpoint['model'] contains a state_dict")
+                    # Try to infer model from args if available
+                    if 'args' in obj:
+                        print(f"Checkpoint args: {obj['args']}")
+                        # Try to load using ColBERT's checkpoint loader
+                        try:
+                            from colbert.modeling.checkpoint import Checkpoint
+                            print(f"Attempting to load ColBERT checkpoint from {path}")
+                            model = Checkpoint(path, colbert_config=None)
+                            print("Successfully loaded ColBERT model")
+                        except Exception as e:
+                            print(f"Could not load as ColBERT checkpoint: {e}")
+                            print('Please provide the model architecture or use --type hf for HuggingFace models.')
+                            return
+                    else:
+                        print('The loaded file contains a state_dict. Please provide the model architecture.')
+                        return
+                else:
+                    print(f"checkpoint['model'] has unexpected type: {type(obj['model'])}")
+                    return
             elif 'state_dict' in obj:
                 print('The loaded file contains a state_dict. Please provide the model architecture or use --type hf/splade.')
                 print('Available keys in checkpoint:', list(obj.keys()))
