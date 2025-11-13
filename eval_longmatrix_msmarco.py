@@ -384,6 +384,101 @@ def evaluate_all(ranked_lists: Dict, qrels: Dict):
     print("="*70)
 
 
+# ========================= BM25 Implementation =========================
+
+class BM25:
+    """Simple BM25 implementation for baseline comparison"""
+    def __init__(self, k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+        self.idf = {}
+        self.doc_lens = {}
+        self.avg_doc_len = 0
+        self.N = 0
+        
+    def tokenize(self, text: str) -> List[str]:
+        """Simple whitespace tokenization and lowercasing"""
+        return text.lower().split()
+    
+    def fit(self, passages: Dict[str, str]):
+        """Build IDF scores from passage collection"""
+        print("\nBuilding BM25 index...")
+        self.N = len(passages)
+        
+        # Calculate document frequencies
+        df = defaultdict(int)
+        total_len = 0
+        
+        for pid, text in tqdm(passages.items(), desc="Indexing passages"):
+            tokens = self.tokenize(text)
+            self.doc_lens[pid] = len(tokens)
+            total_len += len(tokens)
+            
+            # Count unique terms in document
+            unique_tokens = set(tokens)
+            for token in unique_tokens:
+                df[token] += 1
+        
+        # Calculate average document length
+        self.avg_doc_len = total_len / self.N if self.N > 0 else 0
+        
+        # Calculate IDF scores
+        for term, freq in df.items():
+            self.idf[term] = math.log((self.N - freq + 0.5) / (freq + 0.5) + 1)
+        
+        print(f"✓ Built BM25 index: {self.N} docs, avg_len={self.avg_doc_len:.1f}, vocab={len(self.idf)}")
+    
+    def score(self, query: str, doc: str) -> float:
+        """Calculate BM25 score for a query-document pair"""
+        query_tokens = self.tokenize(query)
+        doc_tokens = self.tokenize(doc)
+        
+        # Count term frequencies in document
+        doc_tf = defaultdict(int)
+        for token in doc_tokens:
+            doc_tf[token] += 1
+        
+        doc_len = len(doc_tokens)
+        score = 0.0
+        
+        for token in query_tokens:
+            if token not in doc_tf:
+                continue
+                
+            tf = doc_tf[token]
+            idf = self.idf.get(token, 0)
+            
+            # BM25 formula
+            numerator = tf * (self.k1 + 1)
+            denominator = tf + self.k1 * (1 - self.b + self.b * doc_len / self.avg_doc_len)
+            score += idf * (numerator / denominator)
+        
+        return score
+    
+    def retrieve(self, queries: Dict[str, str], passages: Dict[str, str], k: int = 1000) -> Dict[str, List[str]]:
+        """Retrieve top-k passages for each query"""
+        print(f"\nRetrieving with BM25 (k1={self.k1}, b={self.b})...")
+        
+        ranked_lists = {}
+        passage_ids = list(passages.keys())
+        
+        for qid, query in tqdm(queries.items(), desc="Searching with BM25"):
+            scores = []
+            for pid in passage_ids:
+                score = self.score(query, passages[pid])
+                scores.append((score, pid))
+            
+            # Sort by score descending
+            scores.sort(reverse=True, key=lambda x: x[0])
+            
+            # Get top-k
+            top_k = min(k, len(scores))
+            ranked_lists[qid] = [pid for _, pid in scores[:top_k]]
+        
+        print(f"✓ Retrieved results for {len(ranked_lists)} queries")
+        return ranked_lists
+
+
 # ========================= Retrieval =========================
 
 @torch.no_grad()
@@ -535,8 +630,8 @@ def retrieve_with_longmatrix(model, queries: Dict, passages: Dict,
 
 def main():
     parser = argparse.ArgumentParser(description='Evaluate LongMatrix on MS MARCO')
-    parser.add_argument('--checkpoint', type=str, required=True,
-                        help='Path to model checkpoint (.pt file)')
+    parser.add_argument('--checkpoint', type=str, required=False, default=None,
+                        help='Path to model checkpoint (.pt file) - not required if --use_bm25 is set')
     parser.add_argument('--dataset', type=str, default='msmarco',
                         choices=['msmarco'],
                         help='Dataset to evaluate on')
@@ -570,7 +665,21 @@ def main():
     parser.add_argument('--topk_d', type=int, default=1,
                         help='Number of doc tokens for late interaction')
     
+    # BM25 baseline options
+    parser.add_argument('--use_bm25', action='store_true',
+                        help='Use BM25 for retrieval instead of LongMatrix')
+    parser.add_argument('--bm25_k1', type=float, default=1.5,
+                        help='BM25 k1 parameter (term saturation)')
+    parser.add_argument('--bm25_b', type=float, default=0.75,
+                        help='BM25 b parameter (length normalization)')
+    parser.add_argument('--compare_with_bm25', action='store_true',
+                        help='Compare LongMatrix results with BM25 baseline')
+    
     args = parser.parse_args()
+    
+    # Validate arguments
+    if not args.use_bm25 and not args.checkpoint:
+        parser.error("--checkpoint is required when not using --use_bm25")
     
     # Check device
     if args.device == 'cuda' and not torch.cuda.is_available():
@@ -588,66 +697,74 @@ def main():
     print(f"Top-K: {args.k}")
     print("="*70)
     
-    # Load checkpoint
-    print("\nLoading model checkpoint...")
-    if not os.path.exists(args.checkpoint):
-        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
+    # Load model (skip if using BM25 only)
+    model = None
+    tokenizer = None
+    late_interaction = args.late_interaction
+    topk_q = args.topk_q
+    topk_d = args.topk_d
     
-    ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-    
-    # Get model args from checkpoint
-    model_args = ckpt.get('args', {})
-    if isinstance(model_args, dict):
-        d_lex_emb = model_args.get('d_lex_emb', 128)
-        d_lex = model_args.get('d_lex', 128)
-        m_teacher = model_args.get('m_teacher', 1024)
-        rank = model_args.get('rank', 64)
-        heads = model_args.get('heads', 4)
-        tokenizer_name = model_args.get('tokenizer', 'BAAI/bge-m3')
+    if not args.use_bm25:
+        # Load checkpoint
+        print("\nLoading model checkpoint...")
+        if not os.path.exists(args.checkpoint):
+            raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
         
-        # Late interaction settings from checkpoint
-        late_interaction = model_args.get('late_interaction', False)
-        topk_q = model_args.get('topk_q', 4)
-        topk_d = model_args.get('topk_d', 1)
+        ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
         
-        # Override with command line args if provided
-        if args.late_interaction:
-            late_interaction = True
+        # Get model args from checkpoint
+        model_args = ckpt.get('args', {})
+        if isinstance(model_args, dict):
+            d_lex_emb = model_args.get('d_lex_emb', 128)
+            d_lex = model_args.get('d_lex', 128)
+            m_teacher = model_args.get('m_teacher', 1024)
+            rank = model_args.get('rank', 64)
+            heads = model_args.get('heads', 4)
+            tokenizer_name = model_args.get('tokenizer', 'BAAI/bge-m3')
+            
+            # Late interaction settings from checkpoint
+            late_interaction = model_args.get('late_interaction', False)
+            topk_q = model_args.get('topk_q', 4)
+            topk_d = model_args.get('topk_d', 1)
+            
+            # Override with command line args if provided
+            if args.late_interaction:
+                late_interaction = True
+                topk_q = args.topk_q
+                topk_d = args.topk_d
+        else:
+            # Default values
+            d_lex_emb = 128
+            d_lex = 128
+            m_teacher = 1024
+            rank = 64
+            heads = 4
+            tokenizer_name = 'BAAI/bge-m3'
+            late_interaction = args.late_interaction
             topk_q = args.topk_q
             topk_d = args.topk_d
-    else:
-        # Default values
-        d_lex_emb = 128
-        d_lex = 128
-        m_teacher = 1024
-        rank = 64
-        heads = 4
-        tokenizer_name = 'BAAI/bge-m3'
-        late_interaction = args.late_interaction
-        topk_q = args.topk_q
-        topk_d = args.topk_d
-    
-    print(f"Model config: d_lex_emb={d_lex_emb}, d_lex={d_lex}, m={m_teacher}, rank={rank}, heads={heads}")
-    print(f"Tokenizer: {tokenizer_name}")
-    
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
-    
-    # Create model
-    model = LongMatrixModel(
-        tokenizer=tokenizer,
-        d_lex_emb=d_lex_emb,
-        d_lex=d_lex,
-        m_teacher=m_teacher,
-        rank=rank,
-        attn_backend='sdpa',
-        use_ckpt=False,
-        heads=heads
-    ).to(args.device)
-    
-    # Load weights
-    model.load_state_dict(ckpt['model'])
-    print("✓ Model loaded successfully")
+        
+        print(f"Model config: d_lex_emb={d_lex_emb}, d_lex={d_lex}, m={m_teacher}, rank={rank}, heads={heads}")
+        print(f"Tokenizer: {tokenizer_name}")
+        
+        # Load tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+        
+        # Create model
+        model = LongMatrixModel(
+            tokenizer=tokenizer,
+            d_lex_emb=d_lex_emb,
+            d_lex=d_lex,
+            m_teacher=m_teacher,
+            rank=rank,
+            attn_backend='sdpa',
+            use_ckpt=False,
+            heads=heads
+        ).to(args.device)
+        
+        # Load weights
+        model.load_state_dict(ckpt['model'])
+        print("✓ Model loaded successfully")
     
     # Load dataset
     if args.queries_file and args.collection_file and args.qrels_file:
@@ -660,22 +777,78 @@ def main():
         queries, passages, qrels = load_msmarco_dataset(args.split)
     
     # Perform retrieval
-    ranked_lists = retrieve_with_longmatrix(
-        model=model,
-        queries=queries,
-        passages=passages,
-        tokenizer=tokenizer,
-        device=args.device,
-        max_len=args.max_len,
-        batch_size=args.batch_size,
-        k=args.k,
-        late_interaction=late_interaction,
-        topk_q=topk_q,
-        topk_d=topk_d
-    )
-    
-    # Evaluate
-    evaluate_all(ranked_lists, qrels)
+    if args.use_bm25:
+        # Use BM25 only
+        print("\n" + "="*70)
+        print("USING BM25 FOR RETRIEVAL")
+        print("="*70)
+        bm25 = BM25(k1=args.bm25_k1, b=args.bm25_b)
+        bm25.fit(passages)
+        ranked_lists = bm25.retrieve(queries, passages, k=args.k)
+        
+        # Evaluate BM25
+        print("\n" + "="*70)
+        print("BM25 RESULTS")
+        print("="*70)
+        evaluate_all(ranked_lists, qrels)
+        
+    elif args.compare_with_bm25:
+        # Compare LongMatrix with BM25
+        print("\n" + "="*70)
+        print("COMPARING LONGMATRIX WITH BM25")
+        print("="*70)
+        
+        # Get BM25 results
+        print("\n[1/2] Running BM25 baseline...")
+        bm25 = BM25(k1=args.bm25_k1, b=args.bm25_b)
+        bm25.fit(passages)
+        bm25_ranked_lists = bm25.retrieve(queries, passages, k=args.k)
+        
+        # Get LongMatrix results
+        print("\n[2/2] Running LongMatrix...")
+        ranked_lists = retrieve_with_longmatrix(
+            model=model,
+            queries=queries,
+            passages=passages,
+            tokenizer=tokenizer,
+            device=args.device,
+            max_len=args.max_len,
+            batch_size=args.batch_size,
+            k=args.k,
+            late_interaction=late_interaction,
+            topk_q=topk_q,
+            topk_d=topk_d
+        )
+        
+        # Evaluate both
+        print("\n" + "="*70)
+        print("BM25 BASELINE RESULTS")
+        print("="*70)
+        evaluate_all(bm25_ranked_lists, qrels)
+        
+        print("\n" + "="*70)
+        print("LONGMATRIX RESULTS")
+        print("="*70)
+        evaluate_all(ranked_lists, qrels)
+        
+    else:
+        # Use LongMatrix only
+        ranked_lists = retrieve_with_longmatrix(
+            model=model,
+            queries=queries,
+            passages=passages,
+            tokenizer=tokenizer,
+            device=args.device,
+            max_len=args.max_len,
+            batch_size=args.batch_size,
+            k=args.k,
+            late_interaction=late_interaction,
+            topk_q=topk_q,
+            topk_d=topk_d
+        )
+        
+        # Evaluate
+        evaluate_all(ranked_lists, qrels)
     
     # Print sample results
     print("\n" + "="*70)
