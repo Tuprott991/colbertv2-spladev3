@@ -23,6 +23,7 @@ Example:
 import argparse
 import csv
 import os
+import sys
 import time
 import math
 from collections import OrderedDict
@@ -290,25 +291,69 @@ def main():
                 elif isinstance(obj['model'], dict):
                     # It's a state dict - try to reconstruct the model
                     print("checkpoint['model'] contains a state_dict")
-                    # Try to infer model from args if available
+                    
+                    # Check if this is a LongMatrix checkpoint
                     if 'args' in obj:
-                        # Print only summary of args to avoid dumping large data
                         args_obj = obj['args']
-                        if hasattr(args_obj, '__dict__'):
-                            print(f"Checkpoint has args with type: {type(args_obj).__name__}")
-                        else:
-                            print(f"Checkpoint has args of type: {type(args_obj)}")
+                        print(f"Checkpoint has args of type: {type(args_obj)}")
                         
-                        # Try to load using ColBERT's checkpoint loader
-                        try:
-                            from colbert.modeling.checkpoint import Checkpoint
-                            print(f"Attempting to load ColBERT checkpoint from {path}")
-                            model = Checkpoint(path, colbert_config=None)
-                            print("Successfully loaded ColBERT model")
-                        except Exception as e:
-                            print(f"Could not load as ColBERT checkpoint: {e}")
-                            print('Please provide the model architecture or use --type hf for HuggingFace models.')
-                            return
+                        # Try LongMatrix model reconstruction
+                        is_longmatrix = False
+                        if isinstance(args_obj, dict):
+                            # Check for LongMatrix-specific args
+                            if 'd_lex' in args_obj or 'd_lex_emb' in args_obj or 'tokenizer' in args_obj:
+                                is_longmatrix = True
+                                print("Detected LongMatrix checkpoint")
+                        
+                        if is_longmatrix:
+                            try:
+                                print("Attempting to reconstruct LongMatrix model from checkpoint args...")
+                                # Import local LongMatrix if available
+                                sys.path.insert(0, os.path.dirname(path))
+                                try:
+                                    from train_longmatrix import LongMatrixModel
+                                    print("Imported LongMatrixModel from train_longmatrix.py")
+                                except ImportError:
+                                    print("Could not import from train_longmatrix.py")
+                                    print("Please ensure train_longmatrix.py is in the same directory as the checkpoint")
+                                    print("Or use --type hf to load the underlying HuggingFace model")
+                                    return
+                                
+                                # Reconstruct model with args
+                                tokenizer_name = args_obj.get('tokenizer', 'BAAI/bge-m3')
+                                from transformers import AutoTokenizer
+                                tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+                                
+                                model = LongMatrixModel(
+                                    tokenizer=tok,
+                                    d_lex_emb=args_obj.get('d_lex_emb', 128),
+                                    d_lex=args_obj.get('d_lex', 128),
+                                    m_teacher=args_obj.get('m_teacher', 1024),
+                                    rank=args_obj.get('rank', 64),
+                                    attn_backend=args_obj.get('attn_backend', 'sdpa'),
+                                    use_ckpt=False,  # disable checkpoint for inference
+                                    heads=args_obj.get('heads', 4)
+                                )
+                                model.load_state_dict(obj['model'])
+                                model = model.to(device)
+                                print("Successfully loaded LongMatrix model")
+                            except Exception as e:
+                                print(f"Could not reconstruct LongMatrix model: {e}")
+                                import traceback
+                                traceback.print_exc()
+                                print('\nPlease ensure train_longmatrix.py is available in the same directory.')
+                                return
+                        else:
+                            # Try to load using ColBERT's checkpoint loader
+                            try:
+                                from colbert.modeling.checkpoint import Checkpoint
+                                print(f"Attempting to load ColBERT checkpoint from {path}")
+                                model = Checkpoint(path, colbert_config=None)
+                                print("Successfully loaded ColBERT model")
+                            except Exception as e:
+                                print(f"Could not load as ColBERT checkpoint: {e}")
+                                print('Please provide the model architecture or use --type hf for HuggingFace models.')
+                                return
                     else:
                         print('The loaded file contains a state_dict. Please provide the model architecture.')
                         return
