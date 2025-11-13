@@ -148,11 +148,22 @@ def main():
     print("\n" + "="*60)
     print("DEBUG: Ranking inspection")
     print("="*60)
-    print(f"Total queries in ranking: {len(ranking)}")
+    print(f"Ranking type: {type(ranking)}")
+    
+    # Convert Ranking object to dict - try different methods
+    try:
+        ranking_dict = ranking.todict()
+    except:
+        try:
+            ranking_dict = dict(ranking.data)
+        except:
+            ranking_dict = {qid: ranking[qid] for qid in range(len(queries))}
+    
+    print(f"Total queries in ranking: {len(ranking_dict)}")
     
     # Show first 5 query results
     print("\nFirst 5 queries - raw ranking format:")
-    for i, (qid, hits) in enumerate(list(ranking.items())[:5]):
+    for i, (qid, hits) in enumerate(list(ranking_dict.items())[:5]):
         print(f"\n  Query ID: {qid} (type: {type(qid).__name__})")
         print(f"  Number of hits: {len(hits)}")
         if len(hits) > 0:
@@ -162,7 +173,7 @@ def main():
     
     # Count unique returned pids
     all_returned_pids = set()
-    for qid, hits in ranking.items():
+    for qid, hits in ranking_dict.items():
         for h in hits:
             if isinstance(h, (list, tuple)) and len(h) >= 3:
                 pid = h[0]  # (pid, rank, score)
@@ -179,7 +190,7 @@ def main():
     # ranking will contain for each qid a list of (pid, rank, score)
     ranked_lists = {
         int(qid): [int(pid) for (pid, rank, score) in hits]
-        for qid, hits in ranking.items()
+        for qid, hits in ranking_dict.items()
     }
     print(f"Retrieved results for {len(ranked_lists)} queries")
 
