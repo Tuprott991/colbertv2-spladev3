@@ -27,9 +27,11 @@ import numpy as np
 try:
     from datasets import load_dataset
     _HAS_DATASETS = True
-except ImportError:
+except (ImportError, AttributeError) as e:
     _HAS_DATASETS = False
-    print("⚠️  datasets not installed. Install: pip install datasets")
+    print(f"⚠️  datasets not available: {e}")
+    print("    Solution 1: Use local TSV files with --queries_file, --collection_file, --qrels_file")
+    print("    Solution 2: Fix httpx: pip install --upgrade httpx datasets")
 
 
 # ========================= Model Definition =========================
@@ -243,7 +245,11 @@ def _batch_late_scores(zq: torch.Tensor, zd: torch.Tensor) -> torch.Tensor:
 def load_msmarco_dataset(split='dev'):
     """Load MS MARCO dataset from Hugging Face"""
     if not _HAS_DATASETS:
-        raise RuntimeError("datasets not installed. pip install datasets")
+        raise RuntimeError(
+            "Hugging Face datasets not available.\n"
+            "Solution 1: Fix dependency - Run: pip install --upgrade httpx datasets\n"
+            "Solution 2: Use local files - Add: --queries_file queries.tsv --collection_file collection.tsv --qrels_file qrels.tsv"
+        )
     
     print(f"\nLoading MS MARCO {split} set from Hugging Face...")
     
@@ -421,12 +427,22 @@ def retrieve_with_longmatrix(model, queries: Dict, passages: Dict,
     KQ = topk_q if late_interaction else 1
     KD = topk_d if late_interaction else 1
     
+    # Warning for very large topk values
+    if KD > 50:
+        print(f"⚠️  WARNING: topk_d={KD} is very large!")
+        print(f"   This will be VERY slow and memory-intensive.")
+        print(f"   Consider using topk_d=1-4 for practical retrieval.")
+    if KQ > 50:
+        print(f"⚠️  WARNING: topk_q={KQ} is very large!")
+        print(f"   Consider using topk_q=4-8 for good balance.")
+    
     # Encode all passages
     print(f"\nEncoding {len(passages)} passages...")
     passage_ids = list(passages.keys())
     passage_texts = [passages[pid] for pid in passage_ids]
     
     all_passage_embeddings = []
+    max_kd_actual = 0  # Track the actual max number of tokens
     
     for i in tqdm(range(0, len(passage_texts), batch_size), desc="Encoding passages"):
         batch = passage_texts[i:i+batch_size]
@@ -440,10 +456,29 @@ def retrieve_with_longmatrix(model, queries: Dict, passages: Dict,
         if z.dim() == 2:
             z = z.unsqueeze(1)  # (B, 1, m)
         
+        # Track actual max tokens (may be less than KD for short docs)
+        max_kd_actual = max(max_kd_actual, z.size(1))
+        
         all_passage_embeddings.append(z.cpu())
     
-    passage_embeddings = torch.cat(all_passage_embeddings, dim=0)  # (num_passages, Kd, m)
+    # Pad all embeddings to the same size (max_kd_actual)
+    # This handles cases where documents have fewer than KD tokens
+    padded_embeddings = []
+    for z_batch in all_passage_embeddings:
+        B, K_actual, M = z_batch.shape
+        if K_actual < max_kd_actual:
+            # Pad with zeros to match max_kd_actual
+            padding = torch.zeros(B, max_kd_actual - K_actual, M, dtype=z_batch.dtype)
+            z_batch = torch.cat([z_batch, padding], dim=1)
+        padded_embeddings.append(z_batch)
+    
+    passage_embeddings = torch.cat(padded_embeddings, dim=0)  # (num_passages, max_kd_actual, m)
     passage_embeddings = passage_embeddings.to(device)
+    
+    # Update KD to actual value for consistency
+    KD_actual = max_kd_actual
+    if KD_actual < KD:
+        print(f"⚠️  Note: Requested topk_d={KD}, but max actual tokens in docs is {KD_actual}")
     
     print(f"✓ Passage embeddings shape: {passage_embeddings.shape}")
     
@@ -467,6 +502,11 @@ def retrieve_with_longmatrix(model, queries: Dict, passages: Dict,
         
         if zq.dim() == 2:
             zq = zq.unsqueeze(1)  # (B, 1, m)
+        
+        # Pad queries to match KD_actual if needed (for late interaction consistency)
+        # This is only needed if we have very short queries
+        B_q, K_q_actual, M_q = zq.shape
+        # No padding needed for queries - they can have different K from docs
         
         # Compute similarities
         if late_interaction:
