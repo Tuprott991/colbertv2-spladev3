@@ -144,6 +144,38 @@ def main():
     print(f"\nSearching {len(queries)} queries...")
     ranking = searcher.search_all(queries, k=k)
     
+    # ===== DEBUG: Inspect ranking format and content =====
+    print("\n" + "="*60)
+    print("DEBUG: Ranking inspection")
+    print("="*60)
+    print(f"Total queries in ranking: {len(ranking)}")
+    
+    # Show first 5 query results
+    print("\nFirst 5 queries - raw ranking format:")
+    for i, (qid, hits) in enumerate(list(ranking.items())[:5]):
+        print(f"\n  Query ID: {qid} (type: {type(qid).__name__})")
+        print(f"  Number of hits: {len(hits)}")
+        if len(hits) > 0:
+            print(f"  First hit raw: {hits[0]} (type: {type(hits[0]).__name__})")
+            if len(hits) > 1:
+                print(f"  Second hit raw: {hits[1]}")
+    
+    # Count unique returned pids
+    all_returned_pids = set()
+    for qid, hits in ranking.items():
+        for h in hits:
+            if isinstance(h, (list, tuple)) and len(h) >= 3:
+                pid = h[0]  # (pid, rank, score)
+            elif isinstance(h, (list, tuple)) and len(h) >= 1:
+                pid = h[0]  # (pid, ...)
+            else:
+                pid = h
+            all_returned_pids.add(pid)
+    
+    print(f"\n  Total unique PIDs returned across all queries: {len(all_returned_pids)}")
+    print(f"  Sample PIDs (first 10): {list(all_returned_pids)[:10]}")
+    print("="*60 + "\n")
+    
     # ranking will contain for each qid a list of (pid, rank, score)
     ranked_lists = {
         int(qid): [int(pid) for (pid, rank, score) in hits]
@@ -153,6 +185,43 @@ def main():
 
     # 3. Load qrels
     qrels = load_qrels(qrels_path)
+    
+    # ===== DEBUG: Inspect qrels =====
+    print("\n" + "="*60)
+    print("DEBUG: Qrels inspection")
+    print("="*60)
+    print(f"Total queries with relevance judgments: {len(qrels)}")
+    total_relevant = sum(len(pids) for pids in qrels.values())
+    print(f"Total relevant documents: {total_relevant}")
+    if len(qrels) > 0:
+        avg_relevant = total_relevant / len(qrels)
+        print(f"Average relevant docs per query: {avg_relevant:.2f}")
+    
+    # Show first 5 qrels
+    print("\nFirst 5 queries in qrels:")
+    for i, (qid, rel_pids) in enumerate(list(qrels.items())[:5]):
+        print(f"  QID {qid}: {len(rel_pids)} relevant docs -> {sorted(list(rel_pids))[:10]}")
+    
+    # Check overlap between retrieved and qrels
+    qids_in_ranking = set(ranked_lists.keys())
+    qids_in_qrels = set(qrels.keys())
+    overlap = qids_in_ranking & qids_in_qrels
+    print(f"\nQuery ID overlap:")
+    print(f"  QIDs in ranking: {len(qids_in_ranking)}")
+    print(f"  QIDs in qrels: {len(qids_in_qrels)}")
+    print(f"  Overlap (will be evaluated): {len(overlap)}")
+    
+    # Check a sample query's retrieval vs relevance
+    if len(overlap) > 0:
+        sample_qid = list(overlap)[0]
+        retrieved = ranked_lists[sample_qid]
+        relevant = qrels[sample_qid]
+        hits = set(retrieved) & relevant
+        print(f"\nSample evaluation (QID {sample_qid}):")
+        print(f"  Retrieved (top {len(retrieved)}): {retrieved}")
+        print(f"  Relevant: {sorted(list(relevant))}")
+        print(f"  Hits: {sorted(list(hits))} ({len(hits)}/{len(relevant)} relevant found)")
+    print("="*60 + "\n")
 
     # 4. Evaluate
     evaluate_all(ranked_lists, qrels)
