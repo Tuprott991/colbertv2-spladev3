@@ -256,8 +256,13 @@ def _batch_late_scores(zq: torch.Tensor, zd: torch.Tensor) -> torch.Tensor:
 
 # ========================= Data Loading =========================
 
-def load_msmarco_dataset(split='dev'):
-    """Load MS MARCO dataset from Hugging Face"""
+def load_msmarco_dataset(split='dev', version='v2.1'):
+    """Load MS MARCO dataset from Hugging Face
+    
+    Args:
+        split: 'train', 'dev', or 'validation'
+        version: 'v1.1' or 'v2.1'
+    """
     if not _HAS_DATASETS:
         raise RuntimeError(
             "Hugging Face datasets not available.\n"
@@ -265,11 +270,19 @@ def load_msmarco_dataset(split='dev'):
             "Solution 2: Use local files - Add: --queries_file queries.tsv --collection_file collection.tsv --qrels_file qrels.tsv"
         )
     
-    print(f"\nLoading MS MARCO {split} set from Hugging Face...")
+    print(f"\nLoading MS MARCO {version} {split} set from Hugging Face...")
     
-    # Load MS MARCO passage ranking dataset
-    # Using the standard MS MARCO passage ranking dataset
-    dataset = load_dataset("microsoft/ms_marco", "v2.1", split=split)
+    if version == 'v1.1':
+        return _load_msmarco_v1_1(split)
+    elif version == 'v2.1':
+        return _load_msmarco_v2_1(split)
+    else:
+        raise ValueError(f"Unsupported version: {version}. Use 'v1.1' or 'v2.1'")
+
+
+def _load_msmarco_v1_1(split='dev'):
+    """Load MS MARCO v1.1 - has passages embedded in each query example"""
+    dataset = load_dataset("microsoft/ms_marco", "v1.1", split=split)
     
     queries = {}
     passages = {}
@@ -277,7 +290,7 @@ def load_msmarco_dataset(split='dev'):
     
     print(f"Processing {len(dataset)} examples...")
     
-    for example in tqdm(dataset, desc=f"Loading {split}"):
+    for example in tqdm(dataset, desc=f"Loading v1.1 {split}"):
         qid = example['query_id']
         query = example['query']
         
@@ -295,6 +308,78 @@ def load_msmarco_dataset(split='dev'):
     
     print(f"✓ Loaded {len(queries)} queries")
     print(f"✓ Loaded {len(passages)} passages")
+    print(f"✓ Loaded {len(qrels)} queries with relevance judgments")
+    total_relevant = sum(len(pids) for pids in qrels.values())
+    print(f"✓ Total relevant documents: {total_relevant}")
+    
+    return queries, passages, qrels
+
+
+def _load_msmarco_v2_1(split='dev'):
+    """Load MS MARCO v2.1 - has separate corpus, queries, and qrels"""
+    
+    # MS MARCO v2.1 structure:
+    # - queries: separate dataset with query_id and query text
+    # - corpus: separate dataset with passage_id and passage text  
+    # - qrels: relevance judgments linking queries to passages
+    
+    print("Loading queries...")
+    if split == 'dev':
+        queries_split = 'dev1'  # MS MARCO v2.1 uses 'dev1' for dev queries
+    else:
+        queries_split = split
+    
+    try:
+        queries_dataset = load_dataset("microsoft/ms_marco", "v2.1", split=f"queries.{queries_split}")
+    except:
+        # Try alternative split names
+        try:
+            queries_dataset = load_dataset("microsoft/ms_marco", "v2.1", split="queries.dev")
+        except:
+            queries_dataset = load_dataset("microsoft/ms_marco", "v2.1", split="queries")
+    
+    queries = {}
+    for example in tqdm(queries_dataset, desc="Loading queries"):
+        qid = str(example['query_id'])
+        queries[qid] = example['query']
+    
+    print(f"✓ Loaded {len(queries)} queries")
+    
+    # For v2.1, we need to load the full corpus
+    # This is HUGE (millions of passages), so we'll only load passages that are relevant
+    print("Loading corpus (this may take a while for v2.1)...")
+    
+    try:
+        corpus_dataset = load_dataset("microsoft/ms_marco", "v2.1", split="corpus")
+    except:
+        print("⚠️  Could not load full corpus. This is expected for v2.1.")
+        print("    MS MARCO v2.1 corpus is too large to load directly.")
+        print("    Please use local files with --queries_file, --collection_file, --qrels_file")
+        raise RuntimeError("MS MARCO v2.1 corpus is too large. Use local TSV files instead.")
+    
+    passages = {}
+    for example in tqdm(corpus_dataset, desc="Loading corpus"):
+        pid = str(example['passage_id'])
+        passages[pid] = example['passage']
+    
+    print(f"✓ Loaded {len(passages)} passages")
+    
+    # Load qrels (relevance judgments)
+    print("Loading qrels...")
+    try:
+        qrels_dataset = load_dataset("microsoft/ms_marco", "v2.1", split=f"qrels.{queries_split}")
+    except:
+        try:
+            qrels_dataset = load_dataset("microsoft/ms_marco", "v2.1", split="qrels.dev")
+        except:
+            qrels_dataset = load_dataset("microsoft/ms_marco", "v2.1", split="qrels")
+    
+    qrels = defaultdict(set)
+    for example in tqdm(qrels_dataset, desc="Loading qrels"):
+        qid = str(example['query_id'])
+        pid = str(example['passage_id'])
+        qrels[qid].add(pid)
+    
     print(f"✓ Loaded {len(qrels)} queries with relevance judgments")
     total_relevant = sum(len(pids) for pids in qrels.values())
     print(f"✓ Total relevant documents: {total_relevant}")
@@ -888,6 +973,9 @@ def main():
     parser.add_argument('--split', type=str, default='dev',
                         choices=['dev', 'test'],
                         help='Dataset split to use')
+    parser.add_argument('--version', type=str, default='v2.1',
+                        choices=['v1.1', 'v2.1'],
+                        help='MS MARCO version (v1.1 or v2.1)')
     
     # Alternative: load from local files
     parser.add_argument('--queries_file', type=str, default=None,
@@ -1038,7 +1126,7 @@ def main():
         )
     else:
         # Load from Hugging Face
-        queries, passages, qrels = load_msmarco_dataset(args.split)
+        queries, passages, qrels = load_msmarco_dataset(args.split, version=args.version)
     
     # Helper function to create BM25 instance
     def create_bm25(backend='auto'):
