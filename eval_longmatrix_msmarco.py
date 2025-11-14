@@ -269,7 +269,7 @@ def load_msmarco_dataset(split='dev'):
     
     # Load MS MARCO passage ranking dataset
     # Using the standard MS MARCO passage ranking dataset
-    dataset = load_dataset("microsoft/ms_marco", "v1.1", split=split)
+    dataset = load_dataset("microsoft/ms_marco", "v2.1", split=split)
     
     queries = {}
     passages = {}
