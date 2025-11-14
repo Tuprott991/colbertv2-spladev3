@@ -315,7 +315,7 @@ def _load_msmarco_v1_1(split='dev'):
     return queries, passages, qrels
 
 
-def _load_msmarco_v2_1(split='dev'):
+def _load_msmarco_v2_1(split='test'):
     """Load MS MARCO v2.1 - has separate corpus, queries, and qrels"""
     
     # MS MARCO v2.1 structure:
